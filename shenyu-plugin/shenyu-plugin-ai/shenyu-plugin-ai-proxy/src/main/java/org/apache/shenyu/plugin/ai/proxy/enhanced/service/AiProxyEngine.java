@@ -240,6 +240,24 @@ public final class AiProxyEngine {
     public Mono<Void> execute(final String requestBody, final AiCommonConfig primaryConfig,
                               final Optional<AiCommonConfig> fallbackConfig,
                               final Function<AiUpstreamResponse, Mono<Void>> responseConsumer) {
+        return execute(requestBody, null, primaryConfig, fallbackConfig, responseConsumer);
+    }
+
+    /**
+     * Execute an exchange whose request body was already parsed by the caller, so
+     * the engine reuses that payload for the primary and fallback preparation
+     * instead of parsing the same body again.
+     *
+     * @param requestBody original client request
+     * @param parsedPayload parsed request payload, null lets the engine parse the body
+     * @param primaryConfig resolved primary configuration
+     * @param fallbackConfig resolved fallback configuration
+     * @param responseConsumer response boundary consuming the reactive body once
+     * @return completion or a classified failure
+     */
+    public Mono<Void> execute(final String requestBody, final JsonNode parsedPayload, final AiCommonConfig primaryConfig,
+                              final Optional<AiCommonConfig> fallbackConfig,
+                              final Function<AiUpstreamResponse, Mono<Void>> responseConsumer) {
         return Mono.deferContextual(view -> {
             AiRequestObservation inherited = view.getOrDefault(AiRequestObservation.REACTOR_KEY, null);
             AiRequestObservation observation = Objects.nonNull(inherited) ? inherited
@@ -248,7 +266,8 @@ public final class AiProxyEngine {
             return Mono.defer(() -> {
                 long deadlineNanos = System.nanoTime() + retryProperties.getRequestDeadline().toNanos();
                 String invocationId = UUID.randomUUID().toString();
-                PreparedExchange primary = prepare(requestBody, new AiCommonConfig(primaryConfig));
+                ObjectNode payload = requestPayload(requestBody, parsedPayload);
+                PreparedExchange primary = prepare(requestBody, payload, new AiCommonConfig(primaryConfig));
                 Optional<AiCommonConfig> fallback = fallbackConfig.map(config -> {
                     AiCommonConfig copy = new AiCommonConfig(config);
                     copy.setStream(primary.stream());
@@ -266,8 +285,8 @@ public final class AiProxyEngine {
                     return responseConsumer.apply(response);
                 };
                 Function<Function<AiUpstreamResponse, Mono<Void>>, Mono<Void>> upstream = consumer -> {
-                    Execution execution = new Execution(requestBody, consumer, new AtomicBoolean(), new AtomicInteger(),
-                            invocationId, deadlineNanos, observation);
+                    Execution execution = new Execution(requestBody, payload, consumer, new AtomicBoolean(),
+                            new AtomicInteger(), invocationId, deadlineNanos, observation);
                     return attempt(execution, primary, fallback, maxRetries, maxRetries,
                             AiProxyAttemptEvent.Phase.PRIMARY, fallbackProviderDeclaredReplaySafe);
                 };
@@ -297,7 +316,7 @@ public final class AiProxyEngine {
      * @return upstream request
      */
     public AiUpstreamRequest buildRequest(final String requestBody, final AiCommonConfig config) {
-        return prepare(requestBody, config).request();
+        return prepare(requestBody, requestPayload(requestBody, null), config).request();
     }
 
     private Mono<Void> attempt(final Execution execution, final PreparedExchange prepared,
@@ -465,7 +484,7 @@ public final class AiProxyEngine {
                     error instanceof AiTransportException
                             ? AiProxyAttemptEvent.Reason.FALLBACK_TRANSPORT : AiProxyAttemptEvent.Reason.FALLBACK_STATUS,
                     AiProxyRetryPolicy.retryAfter(responseHeaders, retryProperties));
-            return attempt(execution, prepare(execution.requestBody(), fallback.get()),
+            return attempt(execution, prepare(execution.requestBody(), execution.payload(), fallback.get()),
                     Optional.empty(), 0, 0, AiProxyAttemptEvent.Phase.FALLBACK, false);
         });
     }
@@ -525,9 +544,15 @@ public final class AiProxyEngine {
                 .then();
     }
 
-    private PreparedExchange prepare(final String requestBody, final AiCommonConfig config) {
+    private ObjectNode requestPayload(final String requestBody, final JsonNode parsedPayload) {
         if (Objects.isNull(requestBody) || requestBody.isBlank()) {
             throw new AiProxyException(AiProxyException.Kind.REQUEST, "AI request body must not be empty", null);
+        }
+        if (Objects.nonNull(parsedPayload)) {
+            if (!parsedPayload.isObject()) {
+                throw new AiProxyException(AiProxyException.Kind.REQUEST, "AI request body must be a JSON object", null);
+            }
+            return (ObjectNode) parsedPayload;
         }
         final JsonNode root;
         try {
@@ -538,18 +563,23 @@ public final class AiProxyEngine {
         if (!root.isObject()) {
             throw new AiProxyException(AiProxyException.Kind.REQUEST, "AI request body must be a JSON object", null);
         }
-        ObjectNode payload = (ObjectNode) root;
+        return (ObjectNode) root;
+    }
+
+    private PreparedExchange prepare(final String requestBody, final ObjectNode parsedPayload, final AiCommonConfig config) {
+        // preparation mutates its working copy; the request-scoped payload stays pristine
+        // so a fallback attempt can prepare again without re-parsing the body
+        ObjectNode payload = parsedPayload.deepCopy();
         String upstreamBody = requestBody;
         if (payload.has("fallbackConfig")) {
             payload.remove("fallbackConfig");
             upstreamBody = payload.toString();
         }
-        AiProxyProtocol protocol = Objects.isNull(config.getProtocol()) || config.getProtocol().isBlank()
-                ? aiProxyProtocolFactory.detect(payload) : aiProxyProtocolFactory.getProtocol(config.getProtocol());
-        if (!protocol.matches(payload)) {
+        if (Objects.isNull(config.getProtocol()) || config.getProtocol().isBlank()) {
             throw new AiProxyException(AiProxyException.Kind.REQUEST,
-                    "Request body does not match AI protocol: " + protocol.name(), null);
+                    "AI protocol must be resolved before the request reaches the engine", null);
         }
+        AiProxyProtocol protocol = aiProxyProtocolFactory.getProtocol(config.getProtocol());
         ShenyuAiRequest decoded = applyModelOverride(protocol.decodeRequest(upstreamBody, payload), protocol, config);
         AiProxyProvider provider = aiProxyProviderFactory.getProvider(providerName(config));
         boolean stream = decoded.hasStream() ? decoded.isStream() : Boolean.TRUE.equals(config.getStream());
@@ -633,6 +663,7 @@ public final class AiProxyEngine {
      * Mutable state shared by the primary and fallback phases of one logical request.
      *
      * @param requestBody original client request body
+     * @param payload parsed original request body, reused by a fallback preparation
      * @param responseConsumer client response boundary
      * @param emitted whether response bytes have reached the client
      * @param attemptIndex attempt sequence shared by primary and fallback
@@ -642,6 +673,7 @@ public final class AiProxyEngine {
      */
     private record Execution(
             String requestBody,
+            ObjectNode payload,
             Function<AiUpstreamResponse, Mono<Void>> responseConsumer,
             AtomicBoolean emitted,
             AtomicInteger attemptIndex,
